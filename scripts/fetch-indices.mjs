@@ -19,25 +19,46 @@ const LIST = [
   ['VNCONS', 'Tiêu dùng thiết yếu', 'Ngành', null], ['VNENE', 'Năng lượng', 'Ngành', null], ['VNIND', 'Công nghiệp', 'Ngành', null],
   ['VNUTI', 'Tiện ích', 'Ngành', null],
 ];
-async function candles(sym) {
-  const to = Math.floor(Date.now() / 1000), from = to - 400 * 86400;
-  for (let t = 0; t < 3; t++) {
-    try {
-      const ac = new AbortController(), tm = setTimeout(() => ac.abort(), 15000);
-      const r = await fetch(BASE + '?' + new URLSearchParams({ symbol: sym, resolution: 'D', from: String(from), to: String(to) }), { headers: { Accept: 'application/json', 'User-Agent': UA }, signal: ac.signal });
-      clearTimeout(tm);
-      if (r.ok) {
-        const j = await r.json();
-        if (j && Array.isArray(j.t) && Array.isArray(j.c) && j.t.length === j.c.length && j.c.length) {
-          const rows = j.t.map((t, i) => ({ t: num(t), c: num(j.c[i]) })).filter(x => x.t != null && x.c != null && x.c > 0).sort((a, b) => a.t - b.t);
-          if (rows.length) return rows;
-        }
-        return null; // 200 nhưng rỗng: mã không có
-      }
-      if (r.status === 400 || r.status === 404) return null;
-    } catch (e) { }
-    await sleep(1200 * (t + 1));
+// ---- nhiều nguồn nến ngày: thử lần lượt với VNINDEX, nguồn nào chạy được thì dùng cho mọi chỉ số ----
+const TMO = 12000;
+async function http(url, opt = {}) {
+  const ac = new AbortController(), tm = setTimeout(() => ac.abort(), TMO);
+  try { const r = await fetch(url, { ...opt, headers: { Accept: 'application/json', 'User-Agent': UA, ...(opt.headers || {}) }, signal: ac.signal }); const txt = await r.text(); let j = null; try { j = JSON.parse(txt); } catch (e) { } return { status: r.status, j, head: txt.slice(0, 80).replace(/\s+/g, ' ') }; }
+  catch (e) { return { status: 0, j: null, head: String(e && (e.cause && e.cause.code || e.name || e.message)) }; } finally { clearTimeout(tm); }
+}
+const clean = rows => { const o = rows.filter(x => x.t != null && x.c != null && x.c > 0).sort((a, b) => a.t - b.t); return o.length ? o : null; };
+const SRC = {
+  async dchart(sym) {
+    const to = Math.floor(Date.now() / 1000), r = await http(BASE + '?' + new URLSearchParams({ symbol: sym, resolution: 'D', from: String(to - 400 * 86400), to: String(to) }));
+    const j = r.j; if (j && Array.isArray(j.t) && Array.isArray(j.c) && j.t.length === j.c.length) return { rows: clean(j.t.map((t, i) => ({ t: num(t), c: num(j.c[i]) }))), r };
+    return { rows: null, r };
+  },
+  async vndfinfo(sym) {
+    const from = new Date(Date.now() - 400 * 86400e3).toISOString().slice(0, 10);
+    for (const host of ['https://api-finfo.vndirect.com.vn', 'https://finfo-api.vndirect.com.vn']) {
+      const r = await http(host + '/v4/vnmarket_prices?' + new URLSearchParams({ q: 'code:' + sym + '~date:gte:' + from, sort: 'date', size: '500' }));
+      const d = r.j && Array.isArray(r.j.data) ? r.j.data : null;
+      if (d && d.length) return { rows: clean(d.map(x => ({ t: /^\d{4}-\d{2}-\d{2}/.test(String(x.date)) ? Math.floor(Date.parse(String(x.date).slice(0, 10) + 'T00:00:00+07:00') / 1000) : null, c: num(x.close != null ? x.close : x.adClose) }))), r };
+      if (host.startsWith('https://finfo')) return { rows: null, r };
+    }
+  },
+  async vietcap(sym) {
+    const r = await http('https://trading.vietcap.com.vn/api/chart/OHLCChart/gap-chart', { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: 'https://trading.vietcap.com.vn', Referer: 'https://trading.vietcap.com.vn/' }, body: JSON.stringify({ timeFrame: 'ONE_DAY', symbols: [sym], countBack: 300, to: Math.floor(Date.now() / 1000) + 86400 }) });
+    const x = Array.isArray(r.j) ? r.j[0] : null;
+    if (x && Array.isArray(x.t) && Array.isArray(x.c) && x.t.length === x.c.length) return { rows: clean(x.t.map((t, i) => ({ t: num(t), c: num(x.c[i]) }))), r };
+    return { rows: null, r };
+  },
+};
+let USE = null;
+async function pickSource() {
+  for (const name of Object.keys(SRC)) {
+    const o = await SRC[name]('VNINDEX'); const r = o && o.r || {};
+    console.log('[nguồn ' + name + '] HTTP ' + (r.status || 0) + ' · ' + (o && o.rows ? o.rows.length + ' nến' : 'không có nến') + (o && o.rows ? '' : ' · ' + (r.head || '')));
+    if (o && o.rows) { USE = name; return; }
   }
+}
+async function candles(sym) {
+  for (let t = 0; t < 2; t++) { const o = await SRC[USE](sym); if (o && o.rows) return o.rows; if (o && o.r && (o.r.status === 400 || o.r.status === 404)) return null; await sleep(1000); }
   return null;
 }
 const vnDate = t => new Date((t + 25200) * 1000).toISOString().slice(0, 10);
@@ -58,6 +79,8 @@ function exTotals(ex, d) {
   for (const r of rs) { kl += num(r.tradedQ) || 0; gt += (num(r.tradedV) || 0) * 1e6; nnq += (num(r.buyQ) || 0) - (num(r.sellQ) || 0); nnv += (num(r.buyV) || 0) - (num(r.sellV) || 0); }
   return { kl, gt, nnq, nnv, n: rs.length, day: F.day };
 }
+await pickSource();
+if (!USE) { console.log('LỖI: không nguồn nào trả được nến VNINDEX từ máy chủ GitHub — xem các dòng [nguồn …] ở trên.'); process.exit(1); }
 const indices = {}, missing = []; let day = null;
 for (const [code, name, grp, ex] of LIST) {
   const rows = await candles(code);
@@ -74,4 +97,3 @@ if (!indices.VNINDEX || Object.keys(indices).length < 3) { console.log('LỖI: t
 fs.mkdirSync('data', { recursive: true });
 fs.writeFileSync('data/indices.json', JSON.stringify({ ok: true, day, built: new Date().toISOString(), source: 'VNDirect DChart + data/foreign.json', missing, indices }));
 console.log('OK', Object.keys(indices).length, 'chỉ số; thiếu:', missing.join(',') || 'không');
-  
