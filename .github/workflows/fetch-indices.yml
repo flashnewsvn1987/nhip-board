@@ -1,0 +1,31 @@
+# Dựng data/indices.json -> tab "Chỉ số" của NHIP (Worker đọc qua /proxy/indices)
+# Chạy tay lần đầu: Actions > fetch-indices > Run workflow. Sau đó tự chạy mỗi 30 phút giờ giao dịch (thứ 2-6) và 16:35 giờ VN.
+name: fetch-indices
+on:
+  schedule:
+    - cron: '*/30 2-8 * * 1-5'
+    - cron: '35 9 * * 1-5'
+  workflow_dispatch: {}
+permissions:
+  contents: write
+concurrency:
+  group: fetch-indices
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Dung indices.json
+        run: node scripts/fetch-indices.mjs
+      - name: Commit
+        run: |
+          git config user.name "nhip-bot"
+          git config user.email "nhip-bot@users.noreply.github.com"
+          git add data/indices.json
+          git diff --cached --quiet || (git commit -m "indices $(date -u +%FT%TZ)" && git pull --rebase -q && git push)
+          
